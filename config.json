@@ -1,7 +1,7 @@
 {
   "host": "192.168.1.181",
   "username": "truenas_admin",
-  "api_key": "4-jN3jqhCzvl8HEFoWL3gBPt5bpBLRS3lJdQWJveUeCaaULlamqwy8IMa5ijV4eQkz",
+  "api_key": "",
   "use_ssl": true,
   "verify_ssl": false,
   "port": 8787,
@@ -26,7 +26,7 @@
     "crafty": {
       "base_url": "https://192.168.1.181:30146",
       "server_id": "08bca16c-7c10-4da4-9182-c38e38652c56",
-      "api_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxLCJpYXQiOjE3ODQ0MTA4NjMsInRva2VuX2lkIjoxfQ.JsopEV9vJHw1bIDfhRlZKzz7Ha6YoEWo9vc7meASvIM",
+      "api_token": "",
       "verify_ssl": false
     }
   }
