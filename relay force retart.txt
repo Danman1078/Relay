@@ -1,0 +1,3 @@
+Stop-ScheduledTask -TaskName "TrueNAS-Widget-Relay"
+Get-Process pythonw -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-ScheduledTask -TaskName "TrueNAS-Widget-Relay"

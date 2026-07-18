@@ -1,0 +1,2 @@
+truenas_api_client @ git+https://github.com/truenas/api_client.git@master
+mcstatus>=11,<15
