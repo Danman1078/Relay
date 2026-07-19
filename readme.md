@@ -1,4 +1,4 @@
-# TrueNAS + Minecraft iCUE Widget Relay
+# TrueNAS + Qbittorrent + Minecraft iCUE Widget Relay + 
 
 A local relay that polls a TrueNAS SCALE server and a Crafty-managed
 Minecraft server, then serves the combined state as JSON over
