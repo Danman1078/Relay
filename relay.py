@@ -18,7 +18,9 @@ import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import http.cookiejar
 from datetime import datetime
 from pathlib import Path
 
@@ -60,6 +62,49 @@ CRAFTY_BASE_URL = CRAFTY_CFG.get("base_url", "https://192.168.1.181:30146").rstr
 CRAFTY_SERVER_ID = CRAFTY_CFG.get("server_id", "")
 CRAFTY_API_TOKEN = CRAFTY_CFG.get("api_token", "")
 CRAFTY_VERIFY_SSL = CRAFTY_CFG.get("verify_ssl", False)
+
+# qBittorrent Web API -- polled via cookie-session auth (there's no API-key
+# auth in qBittorrent's WebUI API, only username/password -> session cookie).
+# Doing this here rather than in the browser sidesteps two dead ends: the
+# widget itself has no CORS-safe way to reach a cross-origin host, and even
+# with CORS headers added on the qBittorrent side, the session cookie
+# wouldn't survive the browser's SameSite policy on a cross-site fetch.
+# A plain urllib client has neither restriction.
+QBIT_CFG = CONFIG.get("qbittorrent") or {}
+QBIT_ENABLED = QBIT_CFG.get("enabled", False)
+QBIT_BASE_URL = QBIT_CFG.get("base_url", "http://127.0.0.1:8080").rstrip("/")
+QBIT_USERNAME = QBIT_CFG.get("username", "")
+QBIT_PASSWORD = QBIT_CFG.get("password", "")
+QBIT_POLL_SECONDS = QBIT_CFG.get("poll_seconds", 3)
+QBIT_MAX_ROWS = QBIT_CFG.get("max_rows", 5)
+QBIT_VERIFY_SSL = QBIT_CFG.get("verify_ssl", True)
+
+QBIT_DL_STATES = {"downloading", "metaDL", "allocating", "checkingDL", "forcedDL"}
+QBIT_UP_STATES = {"uploading", "checkingUP", "forcedUP"}
+# Queued/stalled: still incomplete and still *intends* to run (the client
+# will resume it automatically once conditions allow) -- distinct from an
+# explicit stop/pause, which is why this is its own group.
+QBIT_QUEUED_STATES = {"queuedDL", "stalledDL", "queuedUP", "stalledUP"}
+
+
+def qbit_classify(state):
+    """Returns "dl" | "up" | "paused" | "stopped". Deliberately a catch-all
+    (anything not recognized falls into "stopped") rather than exact-set
+    membership only -- an earlier version silently dropped any torrent
+    whose state string wasn't in one of the known sets, which is why a
+    manually-stopped torrent could vanish from the widget entirely instead
+    of showing up as stopped. Covers pausedDL/pausedUP (older qBittorrent),
+    stoppedDL/stoppedUP/stopped (5.0+), and error/missingFiles/unknown/
+    moving/checkingResumeData as a safety net."""
+    if state in QBIT_DL_STATES:
+        return "dl"
+    if state in QBIT_UP_STATES:
+        return "up"
+    if state in QBIT_QUEUED_STATES:
+        return "paused"
+    return "stopped"
+
+
 
 # Update-available check: compares the running MC version against Mojang's
 # public release manifest. Vanilla-only signal (a modpack "update" is really
@@ -172,9 +217,25 @@ STATE = {
         "console_tail": [],           # last few lines from Crafty's server log
         "player_history": [],         # rolling players_online samples, ~last hour
     },
+    "qbittorrent": {
+        "enabled": QBIT_ENABLED,
+        "online": False,
+        "dl_count": None,
+        "up_count": None,
+        "paused_count": None,
+        "stopped_count": None,
+        "dl_speed": None,             # bytes/sec
+        "up_speed": None,             # bytes/sec
+        "dl_data": None,              # session total, bytes
+        "up_data": None,              # session total, bytes
+        "total_count": None,
+        "torrents": [],               # [{hash, name, state, group, progress, dlspeed, upspeed, eta}]
+        "updated_at": None,
+        "error": None,
+    },
 }
 DEBUG = {"last_realtime_raw": None, "last_slow_poll_error": None, "last_realtime_error": None,
-         "last_mc_error": None}
+         "last_mc_error": None, "last_qbit_error": None}
 
 
 def bytes_to_gb(n):
@@ -422,6 +483,173 @@ def crafty_send_action(action):
             crafty_get_stats()
         except Exception:
             pass
+
+
+_QBIT_COOKIE_JAR = http.cookiejar.CookieJar()
+if QBIT_BASE_URL.startswith("https") and not QBIT_VERIFY_SSL:
+    _qbit_ctx = ssl.create_default_context()
+    _qbit_ctx.check_hostname = False
+    _qbit_ctx.verify_mode = ssl.CERT_NONE
+    _QBIT_OPENER = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(_QBIT_COOKIE_JAR),
+        urllib.request.HTTPSHandler(context=_qbit_ctx),
+    )
+else:
+    _QBIT_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_QBIT_COOKIE_JAR))
+_QBIT_LOGGED_IN = False
+
+
+def qbit_request(path, method="GET", form_body=None, timeout=8):
+    """Minimal client for qBittorrent's WebUI API. Session cookie is held in
+    _QBIT_COOKIE_JAR across calls -- same opener every time, like a browser
+    would, but without any of a browser's CORS/SameSite restrictions."""
+    url = f"{QBIT_BASE_URL}{path}"
+    data = form_body.encode() if form_body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Referer", QBIT_BASE_URL)  # some qBittorrent builds check this even with CSRF off
+    if data is not None:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with _QBIT_OPENER.open(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        # qBittorrent returns 403 on bad/expired session -- callers check
+        # for that specifically, so surface it as a normal (status, body)
+        # pair rather than letting it propagate as an exception.
+        return exc.code, exc.read().decode(errors="replace")
+
+
+def qbit_login():
+    global _QBIT_LOGGED_IN
+    if not QBIT_USERNAME:
+        _QBIT_LOGGED_IN = True  # e.g. localhost-bypass or subnet-whitelist auth -- no login call needed
+        return True
+    try:
+        body = f"username={urllib.parse.quote(QBIT_USERNAME)}&password={urllib.parse.quote(QBIT_PASSWORD)}"
+        status, text = qbit_request("/api/v2/auth/login", method="POST", form_body=body)
+        # Older qBittorrent: 200 with body "Ok.". Newer builds (confirmed via
+        # curl -v against a real instance): 204 No Content with an empty
+        # body, but a valid session cookie is still set either way -- that
+        # cookie, not the body text, is the real signal of success.
+        _QBIT_LOGGED_IN = status in (200, 204) and text.strip() in ("", "Ok.")
+        if not _QBIT_LOGGED_IN:
+            DEBUG["last_qbit_error"] = f"login HTTP {status}: {text.strip()[:200]!r}"
+    except Exception as exc:
+        DEBUG["last_qbit_error"] = repr(exc)
+        _QBIT_LOGGED_IN = False
+    return _QBIT_LOGGED_IN
+
+
+def qbit_poll_thread():
+    """Polls qBittorrent's WebUI API for torrent list + transfer totals.
+    Logs in lazily on first use and again if a call ever comes back 403
+    (session expired/qBittorrent restarted)."""
+    global _QBIT_LOGGED_IN
+    while True:
+        try:
+            if not _QBIT_LOGGED_IN and not qbit_login():
+                with STATE_LOCK:
+                    STATE["qbittorrent"]["online"] = False
+                    STATE["qbittorrent"]["error"] = "login failed -- check qbittorrent.username/password in config.json"
+                    STATE["qbittorrent"]["updated_at"] = time.time()
+                time.sleep(QBIT_POLL_SECONDS)
+                continue
+
+            try:
+                status, torrents_raw = qbit_request("/api/v2/torrents/info")
+                if status == 403:
+                    _QBIT_LOGGED_IN = False
+                    raise RuntimeError("session expired (403) -- will re-login next cycle")
+                torrents = json.loads(torrents_raw)
+
+                status2, transfer_raw = qbit_request("/api/v2/transfer/info")
+                if status2 == 403:
+                    _QBIT_LOGGED_IN = False
+                    raise RuntimeError("session expired (403) -- will re-login next cycle")
+                transfer = json.loads(transfer_raw)
+            except urllib.error.URLError as exc:
+                raise RuntimeError(f"can't reach {QBIT_BASE_URL}: {exc}")
+
+            dl, up, paused, stopped = [], [], [], []
+            for t in torrents:
+                group = qbit_classify(t.get("state"))
+                {"dl": dl, "up": up, "paused": paused, "stopped": stopped}[group].append(t)
+            dl.sort(key=lambda t: t.get("dlspeed", 0), reverse=True)
+            up.sort(key=lambda t: t.get("upspeed", 0), reverse=True)
+            paused.sort(key=lambda t: (t.get("name") or "").lower())
+            stopped.sort(key=lambda t: (t.get("name") or "").lower())
+
+            def _row(t, group):
+                return {
+                    "hash": t.get("hash"), "name": t.get("name"), "state": t.get("state"), "group": group,
+                    "progress": t.get("progress"), "dlspeed": t.get("dlspeed"), "upspeed": t.get("upspeed"),
+                    "eta": t.get("eta"),
+                }
+
+            # Row budget priority: actively downloading and explicitly-stopped
+            # torrents are what a person is most likely to want to check on or
+            # act on (tap to resume); queued/stalled next; already-seeding
+            # torrents last, since those need no attention.
+            rows = [_row(t, "dl") for t in dl[:QBIT_MAX_ROWS]]
+            remaining = max(0, QBIT_MAX_ROWS - len(rows))
+            rows += [_row(t, "stopped") for t in stopped[:remaining]]
+            remaining = max(0, QBIT_MAX_ROWS - len(rows))
+            rows += [_row(t, "paused") for t in paused[:remaining]]
+            remaining = max(0, QBIT_MAX_ROWS - len(rows))
+            rows += [_row(t, "up") for t in up[:remaining]]
+
+            with STATE_LOCK:
+                q = STATE["qbittorrent"]
+                q["online"] = True
+                q["dl_count"] = len(dl)
+                q["up_count"] = len(up)
+                q["paused_count"] = len(paused)
+                q["stopped_count"] = len(stopped)
+                q["dl_speed"] = transfer.get("dl_info_speed")
+                q["up_speed"] = transfer.get("up_info_speed")
+                q["dl_data"] = transfer.get("dl_info_data")
+                q["up_data"] = transfer.get("up_info_data")
+                q["total_count"] = len(torrents)
+                q["torrents"] = rows
+                q["updated_at"] = time.time()
+                q["error"] = None
+        except Exception as exc:
+            DEBUG["last_qbit_error"] = repr(exc)
+            with STATE_LOCK:
+                STATE["qbittorrent"]["online"] = False
+                STATE["qbittorrent"]["error"] = str(exc)
+                STATE["qbittorrent"]["updated_at"] = time.time()
+
+        time.sleep(QBIT_POLL_SECONDS)
+
+
+def qbit_torrent_action(torrent_hash, action):
+    """action is "pause" or "resume". qBittorrent 5.0+ (WebAPI v2.11+)
+    renamed these to /torrents/stop and /torrents/start; older builds only
+    have /torrents/pause and /torrents/resume. Try the new path first and
+    fall back to the old one on a 404, so this works either way without
+    needing to know the qBittorrent version up front."""
+    if action not in ("pause", "resume"):
+        raise ValueError(f"unknown action: {action}")
+
+    new_path = "/api/v2/torrents/stop" if action == "pause" else "/api/v2/torrents/start"
+    old_path = f"/api/v2/torrents/{action}"
+    body = f"hashes={urllib.parse.quote(torrent_hash)}"
+
+    if not _QBIT_LOGGED_IN and not qbit_login():
+        raise RuntimeError("not logged in to qBittorrent")
+
+    status, text = qbit_request(new_path, method="POST", form_body=body)
+    if status == 404:
+        status, text = qbit_request(old_path, method="POST", form_body=body)
+    if status == 403:
+        # session expired mid-action -- one retry after a fresh login
+        if qbit_login():
+            status, text = qbit_request(new_path, method="POST", form_body=body)
+            if status == 404:
+                status, text = qbit_request(old_path, method="POST", form_body=body)
+    if status not in (200, 204):
+        raise RuntimeError(f"qBittorrent returned HTTP {status}: {text[:200]!r}")
 
 
 def mc_poll_thread():
@@ -708,6 +936,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/mc-stats":
             with STATE_LOCK:
                 self._send_json(STATE["minecraft"])
+        elif self.path == "/qbit-stats":
+            with STATE_LOCK:
+                self._send_json(STATE["qbittorrent"])
         elif self.path == "/debug":
             self._send_json(DEBUG)
         else:
@@ -760,6 +991,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             threading.Thread(target=crafty_send_action, args=(action,), daemon=True).start()
             self._send_json({"started": True, "action": action})
+        elif self.path == "/qbit-action":
+            if not QBIT_ENABLED:
+                self.send_response(400)
+                self.end_headers()
+                return
+            torrent_hash = payload.get("hash")
+            action = payload.get("action")
+            if not torrent_hash or action not in ("pause", "resume"):
+                self.send_response(400)
+                self.end_headers()
+                return
+            try:
+                qbit_torrent_action(torrent_hash, action)
+                self._send_json({"started": True, "hash": torrent_hash, "action": action})
+            except Exception as exc:
+                DEBUG["last_qbit_error"] = repr(exc)
+                self._send_json({"started": False, "error": str(exc)})
         else:
             self.send_response(404)
             self.end_headers()
@@ -774,6 +1022,8 @@ def main():
     if MC_ENABLED:
         threading.Thread(target=mc_poll_thread, daemon=True).start()
         threading.Thread(target=version_check_thread, daemon=True).start()
+    if QBIT_ENABLED:
+        threading.Thread(target=qbit_poll_thread, daemon=True).start()
     with socketserver.ThreadingTCPServer(("127.0.0.1", PORT), Handler) as httpd:
         print(f"Serving TrueNAS stats on http://127.0.0.1:{PORT}/stats  (debug: /debug)")
         if MC_ENABLED:
@@ -782,6 +1032,8 @@ def main():
             print(f"Crafty control enabled ({CRAFTY_BASE_URL}, server {CRAFTY_SERVER_ID}) -> POST /mc-action")
         else:
             print("Crafty control disabled -- set minecraft.crafty.server_id and api_token in config.json to enable start/stop")
+        if QBIT_ENABLED:
+            print(f"qBittorrent ({QBIT_BASE_URL}) polled every {QBIT_POLL_SECONDS}s -> /qbit-stats")
         httpd.serve_forever()
 
 
