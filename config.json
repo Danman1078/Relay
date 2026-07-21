@@ -18,25 +18,26 @@
     "showBackup": true
   },
   "minecraft": {
-    "enabled": true,
-    "host": "192.168.1.181",
-    "port": 25565,
     "poll_seconds": 15,
     "mod_list_cap": 400,
     "crafty": {
       "base_url": "https://192.168.1.181:30146",
-      "server_id": "08bca16c-7c10-4da4-9182-c38e38652c56",
       "api_token": "",
       "verify_ssl": false
-    }
+    },
+    "servers": [
+      { "name": "Direwolf20 1.21", "host": "192.168.1.181", "port": 25565, "crafty_server_id": "08bca16c-7c10-4da4-9182-c38e38652c56" },
+      { "name": "Direwolf20 1.20", "host": "192.168.1.181", "port": 25566, "crafty_server_id": "bc3d4cd3-08a6-404e-b1cb-a3e6041e6ba6" }
+    ]
   },
   "qbittorrent": {
     "enabled": true,
-    "base_url": "http://192.168.1.112:8080",
+    "base_url": "http://127.0.0.1:8080",
     "username": "admin",
-    "password": "",
+    "password": "6",
     "poll_seconds": 3,
     "max_rows": 20,
-    "verify_ssl": true
+    "verify_ssl": true,
+    "ban_backoff_seconds": 600
   }
 }

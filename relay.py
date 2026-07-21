@@ -40,28 +40,55 @@ USE_SSL = CONFIG.get("use_ssl", True)
 VERIFY_SSL = CONFIG.get("verify_ssl", False)
 TRUENAS_URI = f"{'wss' if USE_SSL else 'ws'}://{HOST}/api/current"
 
-# Minecraft server (e.g. a Crafty-managed FTB/Forge server) polled directly
-# over the Java Server List Ping protocol -- no Crafty API token needed.
-# Crafty's own "is it running" state is a separate concern; this just asks
-# the Minecraft server itself, which also happens to be how mod data is
-# obtained (Forge servers embed it in the ping response).
+# Minecraft servers (e.g. Crafty-managed FTB/Forge servers), each polled
+# directly over the Java Server List Ping protocol -- no Crafty API token
+# needed for this part. Crafty's own control API (below) is a separate,
+# optional concern per server.
+#
+# Each server now runs on its own host:port and can be live/joinable at the
+# same time as the others (this used to assume only one could ever be
+# running, sharing one port -- that's no longer the case, so each entry is
+# fully independent: its own ping target, its own Crafty server_id, its own
+# poll thread, its own slot in STATE).
+#
+# config.json shape:
+#   "minecraft": {
+#     "poll_seconds": 15, "mod_list_cap": 400,
+#     "crafty": {"base_url": ..., "api_token": "...", "verify_ssl": false},
+#     "servers": [
+#       {"name": "Direwolf20", "host": "192.168.1.181", "port": 25565, "crafty_server_id": "..."},
+#       {"name": "Server 2",   "host": "192.168.1.181", "port": 25566, "crafty_server_id": "..."}
+#     ]
+#   }
 MC_CFG = CONFIG.get("minecraft") or {}
-MC_ENABLED = MC_CFG.get("enabled", False)
-MC_HOST = MC_CFG.get("host", HOST)
-MC_PORT = MC_CFG.get("port", 25565)
 MC_POLL_SECONDS = MC_CFG.get("poll_seconds", 15)
 MC_MOD_LIST_CAP = MC_CFG.get("mod_list_cap", 400)  # keep payload sane on huge modpacks
 
-# Crafty's own control API -- only needed for the start/stop button, since
-# the SLP ping above is read-only. Get server_id from Crafty's URL when
-# viewing the server (or GET /api/v2/servers), and api_token from
-# Profile -> API Keys -> Generate Key in the Crafty web UI.
+MC_SERVERS = list(MC_CFG.get("servers") or [])
+if not MC_SERVERS and MC_CFG.get("enabled"):
+    # old single-server config -- treat it as a one-entry list. Crafty's
+    # server_id used to live under minecraft.crafty.server_id; carry that
+    # over too if present.
+    MC_SERVERS = [{
+        "name": "Server",
+        "host": MC_CFG.get("host", HOST),
+        "port": MC_CFG.get("port", 25565),
+        "crafty_server_id": (MC_CFG.get("crafty") or {}).get("server_id", ""),
+    }]
+
+MC_ENABLED = len(MC_SERVERS) > 0
+
+# Crafty's own control API -- only needed for start/stop/restart/backup,
+# since the SLP ping above is read-only. Get each server_id from Crafty's
+# URL when viewing that server (or GET /api/v2/servers), and api_token from
+# Profile -> API Keys -> Generate Key in the Crafty web UI. One shared
+# token/base_url covers all servers; each server's own crafty_server_id
+# (in MC_SERVERS above) says which Crafty-side server it maps to.
 CRAFTY_CFG = MC_CFG.get("crafty") or {}
-CRAFTY_ENABLED = bool(CRAFTY_CFG.get("server_id")) and bool(CRAFTY_CFG.get("api_token"))
 CRAFTY_BASE_URL = CRAFTY_CFG.get("base_url", "https://192.168.1.181:30146").rstrip("/")
-CRAFTY_SERVER_ID = CRAFTY_CFG.get("server_id", "")
 CRAFTY_API_TOKEN = CRAFTY_CFG.get("api_token", "")
 CRAFTY_VERIFY_SSL = CRAFTY_CFG.get("verify_ssl", False)
+CRAFTY_ENABLED = bool(CRAFTY_API_TOKEN) and any(s.get("crafty_server_id") for s in MC_SERVERS)
 
 # qBittorrent Web API -- polled via cookie-session auth (there's no API-key
 # auth in qBittorrent's WebUI API, only username/password -> session cookie).
@@ -78,6 +105,7 @@ QBIT_PASSWORD = QBIT_CFG.get("password", "")
 QBIT_POLL_SECONDS = QBIT_CFG.get("poll_seconds", 3)
 QBIT_MAX_ROWS = QBIT_CFG.get("max_rows", 5)
 QBIT_VERIFY_SSL = QBIT_CFG.get("verify_ssl", True)
+QBIT_BAN_BACKOFF_SECONDS = QBIT_CFG.get("ban_backoff_seconds", 600)
 
 QBIT_DL_STATES = {"downloading", "metaDL", "allocating", "checkingDL", "forcedDL"}
 QBIT_UP_STATES = {"uploading", "checkingUP", "forcedUP"}
@@ -176,47 +204,54 @@ STATE = {
     "backup_tasks": [],
     "updated_at": None,
     "connected": False,
-    "minecraft": {
-        "enabled": MC_ENABLED,
-        "online": False,
-        "host": MC_HOST,
-        "port": MC_PORT,
-        "players_online": None,
-        "players_max": None,
-        "player_names": [],
-        "version": None,
-        "protocol": None,
-        "motd": None,
-        "latency_ms": None,
-        "mod_loader": None,          # "forge" | "vanilla" | None (unknown/offline)
-        "mod_count": None,
-        "mod_list": [],              # [{"id": "...", "version": "..."}]
-        "mod_list_truncated": False,
-        "last_online_at": None,
-        "updated_at": None,
-        "error": None,
-        # Crafty control state (only populated if crafty is configured)
-        "crafty_enabled": CRAFTY_ENABLED,
-        "crafty_running": None,      # True/False/None (None = unknown/not configured)
-        "crafty_starting": None,     # waiting_start -- process is up, MC hasn't finished loading
-        "crafty_updating": None,
-        "crafty_action_pending": None,  # "start" | "stop" | "restart" | "backup" | None
-        "crafty_error": None,
-        "crafty_cpu_percent": None,
-        "crafty_mem": None,           # e.g. "1.2GB" -- Crafty's own formatted string
-        "crafty_mem_percent": None,
-        "world_name": None,
-        "world_size": None,           # e.g. "128MB" -- Crafty's own formatted string
-        "last_backup_triggered_at": None,  # in-memory only -- resets on relay restart,
-                                            # this is "last backup we asked for", not
-                                            # Crafty's own backup history (no API for that)
-        "mc_latest_release": None,
-        "update_available": None,     # None = unknown/not checked yet, True/False once checked
-        "started_at": None,           # epoch, parsed from Crafty's own "started" field
-        "empty_since": None,          # epoch since players_online last hit 0 while running
-        "console_tail": [],           # last few lines from Crafty's server log
-        "player_history": [],         # rolling players_online samples, ~last hour
-    },
+    "minecraft_enabled": MC_ENABLED,
+    "minecraft_servers": [
+        {
+            "name": s.get("name", "Server"),
+            "host": s.get("host", HOST),
+            "port": s.get("port", 25565),
+            "online": False,
+            "players_online": None,
+            "players_max": None,
+            "player_names": [],
+            "version": None,
+            "protocol": None,
+            "motd": None,
+            "latency_ms": None,
+            "mod_loader": None,          # "forge" | "vanilla" | None (unknown/offline)
+            "mod_count": None,
+            "mod_list": [],              # [{"id": "...", "version": "..."}]
+            "mod_list_truncated": False,
+            "last_online_at": None,
+            "updated_at": None,
+            "error": None,
+            "mc_latest_release": None,
+            "update_available": None,    # None = unknown/not checked yet, True/False once checked
+            "empty_since": None,         # epoch since players_online last hit 0 while running
+            "console_tail": [],          # last few lines from Crafty's server log
+            "player_history": [],        # rolling players_online samples, ~last hour
+            # Crafty control state -- only populated if this server has a
+            # crafty_server_id configured (start/stop/restart/backup, plus
+            # CPU/RAM/world/uptime, none of which the ping protocol exposes)
+            "crafty_enabled": CRAFTY_ENABLED and bool(s.get("crafty_server_id")),
+            "crafty_server_id": s.get("crafty_server_id", ""),
+            "crafty_running": None,      # True/False/None (None = unknown/not configured)
+            "crafty_starting": None,     # waiting_start -- process is up, MC hasn't finished loading
+            "crafty_updating": None,
+            "crafty_action_pending": None,  # "start" | "stop" | "restart" | "backup" | None
+            "crafty_error": None,
+            "crafty_cpu_percent": None,
+            "crafty_mem": None,           # human string, e.g. "1.06GB" -- converted from Crafty's raw KB number
+            "crafty_mem_percent": None,
+            "world_name": None,
+            "world_size": None,           # e.g. "128MB" -- Crafty's own formatted string
+            "started_at": None,           # epoch, parsed from Crafty's own "started" field
+            "last_backup_triggered_at": None,  # in-memory only -- resets on relay restart,
+                                                # this is "last backup we asked for", not
+                                                # Crafty's own backup history (no API for that)
+        }
+        for s in MC_SERVERS
+    ],
     "qbittorrent": {
         "enabled": QBIT_ENABLED,
         "online": False,
@@ -421,12 +456,30 @@ def _format_mem_kb(raw):
     return f"{mb:.0f}MB"
 
 
-def crafty_get_stats():
-    """GET /servers/{id}/stats -- used for running/starting/updating state,
-    which the SLP ping alone can't distinguish (e.g. 'process is up but the
-    modpack hasn't finished loading yet' vs 'fully offline'), plus CPU/RAM
-    and world size, which only Crafty (not the ping protocol) exposes."""
-    payload = crafty_request(f"/api/v2/servers/{CRAFTY_SERVER_ID}/stats")
+def _find_server_state(server_name):
+    """Returns the STATE dict for a configured server by name, or None."""
+    for entry in STATE["minecraft_servers"]:
+        if entry["name"] == server_name:
+            return entry
+    return None
+
+
+def _find_crafty_id(server_name):
+    for s in MC_SERVERS:
+        if s.get("name", "Server") == server_name and s.get("crafty_server_id"):
+            return s["crafty_server_id"]
+    return None
+
+
+def crafty_get_stats(server_name):
+    """GET /servers/{id}/stats for one specific server -- each configured
+    server has its own crafty_server_id now, so there's no more guessing
+    which one is 'active'; this just refreshes that one server's own
+    CPU/RAM/world/uptime fields, which the ping protocol can't provide."""
+    sid = _find_crafty_id(server_name)
+    if not sid:
+        return
+    payload = crafty_request(f"/api/v2/servers/{sid}/stats")
     data = payload.get("data") or {}
 
     started_at = None
@@ -435,52 +488,70 @@ def crafty_get_stats():
         try:
             started_at = datetime.strptime(started_raw, "%Y-%m-%d %H:%M:%S").timestamp()
         except Exception:
-            started_at = None  # format mismatch or server hasn't reported a start time yet
+            started_at = None
 
     with STATE_LOCK:
-        mc = STATE["minecraft"]
-        mc["crafty_running"] = bool(data.get("running"))
-        mc["crafty_starting"] = bool(data.get("waiting_start"))
-        mc["crafty_updating"] = bool(data.get("updating"))
-        mc["crafty_cpu_percent"] = data.get("cpu")
-        mc["crafty_mem"] = _format_mem_kb(data.get("mem"))
-        mc["crafty_mem_percent"] = data.get("mem_percent")
-        mc["world_name"] = data.get("world_name")
-        mc["world_size"] = data.get("world_size")
-        mc["started_at"] = started_at
-        mc["crafty_error"] = None
+        entry = _find_server_state(server_name)
+        if entry is None:
+            return
+        entry["crafty_running"] = bool(data.get("running"))
+        entry["crafty_starting"] = bool(data.get("waiting_start"))
+        entry["crafty_updating"] = bool(data.get("updating"))
+        entry["crafty_cpu_percent"] = data.get("cpu")
+        entry["crafty_mem"] = _format_mem_kb(data.get("mem"))
+        entry["crafty_mem_percent"] = data.get("mem_percent")
+        entry["world_name"] = data.get("world_name")
+        entry["world_size"] = data.get("world_size")
+        entry["started_at"] = started_at
+        entry["crafty_error"] = None
 
 
-def crafty_get_logs():
-    """GET /servers/{id}/logs -- Crafty can return a large buffer (its own
-    max_log_lines config, often several hundred), so this keeps only the
-    last few lines rather than shipping the whole thing to the widget."""
-    payload = crafty_request(f"/api/v2/servers/{CRAFTY_SERVER_ID}/logs")
+def crafty_get_logs(server_name):
+    """GET /servers/{id}/logs for one specific server. Crafty can return a
+    large buffer (its own max_log_lines config, often several hundred), so
+    this keeps only the last few lines."""
+    sid = _find_crafty_id(server_name)
+    if not sid:
+        return
+    payload = crafty_request(f"/api/v2/servers/{sid}/logs")
     lines = payload.get("data") or []
     with STATE_LOCK:
-        STATE["minecraft"]["console_tail"] = lines[-6:]
+        entry = _find_server_state(server_name)
+        if entry is not None:
+            entry["console_tail"] = lines[-6:]
 
 
-def crafty_send_action(action):
-    """POST /servers/{id}/action/{start_server|stop_server}. Runs on its own
-    thread so the HTTP handler returns immediately; the widget polls
-    /mc-stats afterwards to see the state change land."""
+def crafty_send_action(server_name, action):
+    """POST /servers/{id}/action/{start_server|stop_server|restart_server|
+    backup_server} for one specific server. Runs on its own thread so the
+    HTTP handler returns immediately; the widget polls /mc-stats afterwards
+    to see the state change land."""
     with STATE_LOCK:
-        STATE["minecraft"]["crafty_action_pending"] = action
+        entry = _find_server_state(server_name)
+        if entry is not None:
+            entry["crafty_action_pending"] = action
+
     try:
-        crafty_request(f"/api/v2/servers/{CRAFTY_SERVER_ID}/action/{action}_server", method="POST")
+        sid = _find_crafty_id(server_name)
+        if not sid:
+            raise ValueError(f"no crafty_server_id configured for {server_name!r}")
+
+        crafty_request(f"/api/v2/servers/{sid}/action/{action}_server", method="POST")
         with STATE_LOCK:
-            STATE["minecraft"]["crafty_error"] = None
-            if action == "backup":
-                STATE["minecraft"]["last_backup_triggered_at"] = time.time()
+            if entry is not None:
+                entry["crafty_error"] = None
+                if action == "backup":
+                    entry["last_backup_triggered_at"] = time.time()
     except Exception as exc:
         with STATE_LOCK:
-            STATE["minecraft"]["crafty_error"] = str(exc)
+            if entry is not None:
+                entry["crafty_error"] = str(exc)
     finally:
         with STATE_LOCK:
-            STATE["minecraft"]["crafty_action_pending"] = None
+            if entry is not None:
+                entry["crafty_action_pending"] = None
         try:
-            crafty_get_stats()
+            crafty_get_stats(server_name)
         except Exception:
             pass
 
@@ -533,7 +604,12 @@ def qbit_login():
         # cookie, not the body text, is the real signal of success.
         _QBIT_LOGGED_IN = status in (200, 204) and text.strip() in ("", "Ok.")
         if not _QBIT_LOGGED_IN:
-            DEBUG["last_qbit_error"] = f"login HTTP {status}: {text.strip()[:200]!r}"
+            body = text.strip()
+            if status == 403 and "banned" in body.lower():
+                DEBUG["last_qbit_error"] = body
+                DEBUG["last_qbit_backoff_until"] = time.time() + QBIT_BAN_BACKOFF_SECONDS
+            else:
+                DEBUG["last_qbit_error"] = f"login HTTP {status}: {body[:200]!r}"
     except Exception as exc:
         DEBUG["last_qbit_error"] = repr(exc)
         _QBIT_LOGGED_IN = False
@@ -547,10 +623,24 @@ def qbit_poll_thread():
     global _QBIT_LOGGED_IN
     while True:
         try:
+            backoff_until = DEBUG.get("last_qbit_backoff_until", 0)
+            if backoff_until > time.time():
+                remaining = int(backoff_until - time.time())
+                with STATE_LOCK:
+                    STATE["qbittorrent"]["online"] = False
+                    STATE["qbittorrent"]["error"] = f"IP temporarily banned by qBittorrent; retrying in {remaining}s"
+                    STATE["qbittorrent"]["updated_at"] = time.time()
+                time.sleep(min(QBIT_POLL_SECONDS,5))
+                continue
+
             if not _QBIT_LOGGED_IN and not qbit_login():
                 with STATE_LOCK:
                     STATE["qbittorrent"]["online"] = False
-                    STATE["qbittorrent"]["error"] = "login failed -- check qbittorrent.username/password in config.json"
+                    err = DEBUG.get("last_qbit_error","")
+                    if "banned" in err.lower():
+                        STATE["qbittorrent"]["error"] = "IP temporarily banned by qBittorrent"
+                    else:
+                        STATE["qbittorrent"]["error"] = "login failed -- check qbittorrent.username/password in config.json"
                     STATE["qbittorrent"]["updated_at"] = time.time()
                 time.sleep(QBIT_POLL_SECONDS)
                 continue
@@ -652,13 +742,15 @@ def qbit_torrent_action(torrent_hash, action):
         raise RuntimeError(f"qBittorrent returned HTTP {status}: {text[:200]!r}")
 
 
-def mc_poll_thread():
-    """Polls the Minecraft server directly (Java Server List Ping), not via
-    Crafty. On success, refreshes every field. On failure (server/container
-    stopped, port unreachable, timeout), only flips online/error/updated_at
-    so the widget can show "last seen" using the previous snapshot rather
-    than blanking everything out."""
-    server = JavaServer(MC_HOST, MC_PORT, timeout=5)
+def mc_poll_thread(server_name, host, port):
+    """Polls one Minecraft server directly (Java Server List Ping), not via
+    Crafty. On success, refreshes every field for this server. On failure
+    (server/container stopped, port unreachable, timeout), only flips
+    online/error/updated_at so the widget can show "last seen" using the
+    previous snapshot rather than blanking everything out. One of these
+    runs per configured server, since each now has its own host:port and
+    can be live independently of the others."""
+    server = JavaServer(host, port, timeout=5)
     while True:
         try:
             status = server.status()
@@ -688,52 +780,56 @@ def mc_poll_thread():
 
             now = time.time()
             with STATE_LOCK:
-                mc = STATE["minecraft"]
-                mc["online"] = True
-                mc["players_online"] = status.players.online
-                mc["players_max"] = status.players.max
-                mc["player_names"] = player_names
-                mc["version"] = status.version.name
-                mc["protocol"] = status.version.protocol
-                mc["motd"] = motd_text
-                mc["latency_ms"] = round(status.latency, 1)
-                mc["mod_loader"] = mod_loader
-                mc["mod_count"] = mod_count
-                mc["mod_list"] = mod_list
-                mc["mod_list_truncated"] = mod_truncated
-                mc["last_online_at"] = now
-                mc["updated_at"] = now
-                mc["error"] = None
+                mc = _find_server_state(server_name)
+                if mc is not None:
+                    mc["online"] = True
+                    mc["players_online"] = status.players.online
+                    mc["players_max"] = status.players.max
+                    mc["player_names"] = player_names
+                    mc["version"] = status.version.name
+                    mc["protocol"] = status.version.protocol
+                    mc["motd"] = motd_text
+                    mc["latency_ms"] = round(status.latency, 1)
+                    mc["mod_loader"] = mod_loader
+                    mc["mod_count"] = mod_count
+                    mc["mod_list"] = mod_list
+                    mc["mod_list_truncated"] = mod_truncated
+                    mc["last_online_at"] = now
+                    mc["updated_at"] = now
+                    mc["error"] = None
 
-                if status.players.online == 0:
-                    if mc["empty_since"] is None:
-                        mc["empty_since"] = now
-                else:
-                    mc["empty_since"] = None
+                    if status.players.online == 0:
+                        if mc["empty_since"] is None:
+                            mc["empty_since"] = now
+                    else:
+                        mc["empty_since"] = None
 
-                history = mc["player_history"]
-                history.append(status.players.online)
-                max_points = max(1, (3600 // MC_POLL_SECONDS))
-                if len(history) > max_points:
-                    del history[: len(history) - max_points]
+                    history = mc["player_history"]
+                    history.append(status.players.online)
+                    max_points = max(1, (3600 // MC_POLL_SECONDS))
+                    if len(history) > max_points:
+                        del history[: len(history) - max_points]
         except Exception as exc:
             DEBUG["last_mc_error"] = repr(exc)
             with STATE_LOCK:
-                mc = STATE["minecraft"]
-                mc["online"] = False
-                mc["updated_at"] = time.time()
-                mc["error"] = str(exc)
-                mc["empty_since"] = None  # "empty while running" doesn't apply once offline
+                mc = _find_server_state(server_name)
+                if mc is not None:
+                    mc["online"] = False
+                    mc["updated_at"] = time.time()
+                    mc["error"] = str(exc)
+                    mc["empty_since"] = None  # "empty while running" doesn't apply once offline
 
-        if CRAFTY_ENABLED:
+        if CRAFTY_ENABLED and _find_crafty_id(server_name):
             try:
-                crafty_get_stats()
+                crafty_get_stats(server_name)
             except Exception as exc:
                 DEBUG["last_mc_error"] = repr(exc)
                 with STATE_LOCK:
-                    STATE["minecraft"]["crafty_error"] = str(exc)
+                    mc = _find_server_state(server_name)
+                    if mc is not None:
+                        mc["crafty_error"] = str(exc)
             try:
-                crafty_get_logs()
+                crafty_get_logs(server_name)
             except Exception as exc:
                 DEBUG["last_mc_error"] = repr(exc)
                 # don't overwrite crafty_error here -- a logs-fetch failure
@@ -756,11 +852,12 @@ def _parse_version_tuple(v):
 
 
 def version_check_thread():
-    """Compares the running MC version against Mojang's public release
-    manifest. Only meaningful for vanilla/unmodified version strings --
-    for a modpack, 'update available' here means a new Minecraft release
-    exists, not that mod updates are available (mcstatus/Crafty have no
-    signal for the latter)."""
+    """Compares each server's running version against Mojang's public
+    release manifest (fetched once per cycle and reused for all servers,
+    rather than once per server). Only meaningful for vanilla/unmodified
+    version strings -- for a modpack, 'update available' here means a new
+    Minecraft release exists, not that mod updates are available
+    (mcstatus/Crafty have no signal for the latter)."""
     while True:
         try:
             req = urllib.request.Request(
@@ -769,26 +866,24 @@ def version_check_thread():
             with urllib.request.urlopen(req, timeout=10) as resp:
                 manifest = json.loads(resp.read())
             latest_release = manifest.get("latest", {}).get("release")
-
-            with STATE_LOCK:
-                current = STATE["minecraft"].get("version")
-                STATE["minecraft"]["mc_latest_release"] = latest_release
-
-            current_tuple = _parse_version_tuple(current)
             latest_tuple = _parse_version_tuple(latest_release)
+
             with STATE_LOCK:
-                if current_tuple and latest_tuple:
-                    # Mojang moved from "1.X.Y" to a year-based "YY.N" scheme in 2026.
-                    # A raw tuple compare across that boundary (e.g. (1,21,1) vs (26,2))
-                    # is always "true" but means nothing -- old and new numbering aren't
-                    # on the same scale, so treat a scheme mismatch as unknown instead.
-                    old_scheme = lambda t: t[0] == 1
-                    if old_scheme(current_tuple) != old_scheme(latest_tuple):
-                        STATE["minecraft"]["update_available"] = None
+                for mc in STATE["minecraft_servers"]:
+                    mc["mc_latest_release"] = latest_release
+                    current_tuple = _parse_version_tuple(mc.get("version"))
+                    if current_tuple and latest_tuple:
+                        # Mojang moved from "1.X.Y" to a year-based "YY.N" scheme in 2026.
+                        # A raw tuple compare across that boundary (e.g. (1,21,1) vs (26,2))
+                        # is always "true" but means nothing -- old and new numbering aren't
+                        # on the same scale, so treat a scheme mismatch as unknown instead.
+                        old_scheme = lambda t: t[0] == 1
+                        if old_scheme(current_tuple) != old_scheme(latest_tuple):
+                            mc["update_available"] = None
+                        else:
+                            mc["update_available"] = latest_tuple > current_tuple
                     else:
-                        STATE["minecraft"]["update_available"] = latest_tuple > current_tuple
-                else:
-                    STATE["minecraft"]["update_available"] = None
+                        mc["update_available"] = None
         except Exception as exc:
             DEBUG["last_mc_error"] = repr(exc)
         time.sleep(VERSION_CHECK_SECONDS)
@@ -935,7 +1030,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(payload)
         elif self.path == "/mc-stats":
             with STATE_LOCK:
-                self._send_json(STATE["minecraft"])
+                self._send_json(STATE["minecraft_servers"])
         elif self.path == "/qbit-stats":
             with STATE_LOCK:
                 self._send_json(STATE["qbittorrent"])
@@ -984,13 +1079,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.end_headers()
                 return
+            server_name = payload.get("server")
+            if not server_name:
+                self.send_response(400)
+                self.end_headers()
+                return
             with STATE_LOCK:
-                already_pending = STATE["minecraft"]["crafty_action_pending"]
+                entry = _find_server_state(server_name)
+                if entry is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                already_pending = entry["crafty_action_pending"]
             if already_pending:
                 self._send_json({"started": False, "reason": "action already in progress"})
                 return
-            threading.Thread(target=crafty_send_action, args=(action,), daemon=True).start()
-            self._send_json({"started": True, "action": action})
+            threading.Thread(target=crafty_send_action, args=(server_name, action), daemon=True).start()
+            self._send_json({"started": True, "action": action, "server": server_name})
         elif self.path == "/qbit-action":
             if not QBIT_ENABLED:
                 self.send_response(400)
@@ -1020,18 +1125,26 @@ def main():
     threading.Thread(target=realtime_thread, daemon=True).start()
     threading.Thread(target=slow_poll_thread, daemon=True).start()
     if MC_ENABLED:
-        threading.Thread(target=mc_poll_thread, daemon=True).start()
+        for s in MC_SERVERS:
+            name = s.get("name", "Server")
+            host = s.get("host", HOST)
+            port = s.get("port", 25565)
+            threading.Thread(target=mc_poll_thread, args=(name, host, port), daemon=True).start()
         threading.Thread(target=version_check_thread, daemon=True).start()
     if QBIT_ENABLED:
         threading.Thread(target=qbit_poll_thread, daemon=True).start()
     with socketserver.ThreadingTCPServer(("127.0.0.1", PORT), Handler) as httpd:
         print(f"Serving TrueNAS stats on http://127.0.0.1:{PORT}/stats  (debug: /debug)")
         if MC_ENABLED:
-            print(f"Minecraft ({MC_HOST}:{MC_PORT}) polled every {MC_POLL_SECONDS}s -> /mc-stats")
+            for s in MC_SERVERS:
+                print(f"  Minecraft '{s.get('name', 'Server')}' ({s.get('host', HOST)}:{s.get('port', 25565)}) "
+                      f"polled every {MC_POLL_SECONDS}s -> /mc-stats")
         if CRAFTY_ENABLED:
-            print(f"Crafty control enabled ({CRAFTY_BASE_URL}, server {CRAFTY_SERVER_ID}) -> POST /mc-action")
+            names = ", ".join(s.get("name", "Server") for s in MC_SERVERS if s.get("crafty_server_id"))
+            print(f"Crafty control enabled ({CRAFTY_BASE_URL}, servers: {names}) -> POST /mc-action")
         else:
-            print("Crafty control disabled -- set minecraft.crafty.server_id and api_token in config.json to enable start/stop")
+            print("Crafty control disabled -- set minecraft.servers[].crafty_server_id and "
+                  "minecraft.crafty.api_token in config.json to enable start/stop")
         if QBIT_ENABLED:
             print(f"qBittorrent ({QBIT_BASE_URL}) polled every {QBIT_POLL_SECONDS}s -> /qbit-stats")
         httpd.serve_forever()
