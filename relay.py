@@ -440,20 +440,57 @@ def crafty_request(path, method="GET", body=None, timeout=8):
         return json.loads(resp.read())
 
 
-def _format_mem_kb(raw):
+_MEM_PLAUSIBLE_MAX_GB = 128  # no realistic home-server Minecraft container exceeds this
+
+
+def _format_mem_raw(raw):
     """Crafty's 'mem' field is a raw number, not the pre-formatted string its
-    own docs example implies -- confirmed empirically (1114112.0 for a ~1GB
-    working set), so it's kilobytes. Convert to a human string ourselves."""
+    own docs example implies. The original assumption here was "it's always
+    kilobytes" (confirmed empirically once: 1114112.0 for a ~1GB working
+    set). That assumption turned out to be wrong: on a real multi-server
+    Crafty instance, one server's raw value really is KB while the OTHER
+    server's raw value is bytes -- same Crafty install, same API, different
+    units, and nothing in the response says which. Interpreting bytes as KB
+    is exactly what produced a ~3000GB reading for a server actually using
+    a few GB.
+
+    There's no field to disambiguate, so use plausibility instead: a real
+    Minecraft server's working set is never in the hundreds/thousands of
+    GB. Try the KB interpretation first (the more common case observed);
+    if that comes out absurd, the raw value must have been bytes instead."""
     if raw is None:
         return None
     try:
-        kb = float(raw)
+        n = float(raw)
     except (TypeError, ValueError):
         return str(raw)  # unexpected shape -- show it rather than hide it
-    mb = kb / 1024
-    if mb >= 1024:
-        return f"{mb / 1024:.2f}GB"
-    return f"{mb:.0f}MB"
+    if n <= 0:
+        return "0MB"
+    kb_gb = n / 1024 / 1024
+    gb = kb_gb if kb_gb <= _MEM_PLAUSIBLE_MAX_GB else n / 1024 ** 3
+    if gb >= 1:
+        return f"{gb:.2f}GB"
+    return f"{gb * 1024:.0f}MB"
+
+
+def _format_mem_from_percent(mem_percent):
+    """Extra cross-check when available: derive used RAM from Crafty's
+    mem_percent (of total host RAM) combined with the host's actual total
+    RAM, which the relay may know from TrueNAS's own reporting.realtime
+    feed. More precise than the raw-value guess above when it's available,
+    but that feed isn't always populated in every deployment, so this
+    returns None (letting the caller fall back to _format_mem_raw) rather
+    than being relied on as the only path."""
+    if mem_percent is None:
+        return None
+    with STATE_LOCK:
+        total_gb = STATE.get("mem_total_gb")
+    if not total_gb:
+        return None
+    used_gb = total_gb * (mem_percent / 100)
+    if used_gb >= 1:
+        return f"{used_gb:.2f}GB"
+    return f"{used_gb * 1024:.0f}MB"
 
 
 def _find_server_state(server_name):
@@ -490,6 +527,11 @@ def crafty_get_stats(server_name):
         except Exception:
             started_at = None
 
+    mem_percent = data.get("mem_percent")
+    mem_str = _format_mem_from_percent(mem_percent)
+    if mem_str is None:
+        mem_str = _format_mem_raw(data.get("mem"))
+
     with STATE_LOCK:
         entry = _find_server_state(server_name)
         if entry is None:
@@ -498,8 +540,8 @@ def crafty_get_stats(server_name):
         entry["crafty_starting"] = bool(data.get("waiting_start"))
         entry["crafty_updating"] = bool(data.get("updating"))
         entry["crafty_cpu_percent"] = data.get("cpu")
-        entry["crafty_mem"] = _format_mem_kb(data.get("mem"))
-        entry["crafty_mem_percent"] = data.get("mem_percent")
+        entry["crafty_mem"] = mem_str
+        entry["crafty_mem_percent"] = mem_percent
         entry["world_name"] = data.get("world_name")
         entry["world_size"] = data.get("world_size")
         entry["started_at"] = started_at
@@ -978,12 +1020,29 @@ def slow_poll_thread():
                             continue
                         job = t.get("job") or {}
                         finished = job.get("time_finished")
-                        backup_tasks.append({
+                        started = job.get("time_started")
+                        state = (job.get("state") or "UNKNOWN").upper()
+                        entry = {
                             "name": (t.get("description") or "Cloud Sync").split(" - ")[0][:40],
                             "direction": t.get("direction"),
-                            "state": (job.get("state") or "UNKNOWN").upper(),
+                            "state": state,
                             "finished": str(finished)[:16] if finished else None,
-                        })
+                        }
+                        if state == "FAILED":
+                            # last_run: prefer when it started (a failed job may
+                            # never have reached time_finished); fall back to
+                            # time_finished if that's all we have.
+                            last_run = started or finished
+                            if last_run:
+                                entry["last_run"] = str(last_run)[:16]
+                            # TrueNAS job objects carry the failure reason in
+                            # "error" (short) and/or "exception" (full traceback);
+                            # take the first line of whichever is present and cap
+                            # it so a stray traceback can't blow out the tile.
+                            err = job.get("error") or job.get("exception")
+                            if err:
+                                entry["error"] = str(err).strip().splitlines()[0][:120]
+                        backup_tasks.append(entry)
                 except Exception:
                     pass
                 # failed/running first
@@ -1090,10 +1149,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_response(404)
                     self.end_headers()
                     return
-                already_pending = entry["crafty_action_pending"]
-            if already_pending:
-                self._send_json({"started": False, "reason": "action already in progress"})
-                return
+                if entry["crafty_action_pending"]:
+                    self._send_json({"started": False, "reason": "action already in progress"})
+                    return
+                # Reserve the slot inside the same locked block as the check
+                # above, rather than reading crafty_action_pending here and
+                # letting crafty_send_action() set it on its own thread a
+                # moment later -- that gap let two rapid requests (a
+                # double-tap, or a client retry) both pass the "already
+                # pending" check and fire the same action twice against
+                # Crafty before either had a chance to claim it.
+                entry["crafty_action_pending"] = action
             threading.Thread(target=crafty_send_action, args=(server_name, action), daemon=True).start()
             self._send_json({"started": True, "action": action, "server": server_name})
         elif self.path == "/qbit-action":
