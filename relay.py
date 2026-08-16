@@ -114,6 +114,21 @@ QBIT_UP_STATES = {"uploading", "checkingUP", "forcedUP"}
 # explicit stop/pause, which is why this is its own group.
 QBIT_QUEUED_STATES = {"queuedDL", "stalledDL", "queuedUP", "stalledUP"}
 
+# Seerr (media request app) -- polled via its REST API using an API key
+# (Settings -> General -> API Key in Seerr). Same urllib-based approach as
+# qBittorrent above, no extra dependency needed.
+# config.json shape:
+#   "seerr": {
+#     "enabled": true, "base_url": "http://192.168.1.181:30357",
+#     "api_key": "...", "poll_seconds": 30
+#   }
+SEERR_CFG = CONFIG.get("seerr") or {}
+SEERR_ENABLED = SEERR_CFG.get("enabled", False)
+SEERR_BASE_URL = SEERR_CFG.get("base_url", "http://192.168.1.181:30357").rstrip("/")
+SEERR_API_KEY = SEERR_CFG.get("api_key", "")
+SEERR_POLL_SECONDS = SEERR_CFG.get("poll_seconds", 30)
+SEERR_REQUEST_STATUS_PENDING = 1
+
 
 def qbit_classify(state):
     """Returns "dl" | "up" | "paused" | "stopped". Deliberately a catch-all
@@ -268,9 +283,21 @@ STATE = {
         "updated_at": None,
         "error": None,
     },
+    "seerr": {
+        "enabled": SEERR_ENABLED,
+        "online": False,
+        "openRequestsCount": None,
+        "requests": [],      # [{id, tmdbId, title, poster, type, requestedBy, status, requestStatus}]
+        "recentMovies": [],  # [{id, tmdbId, title, poster, type, status}]
+        "recentTV": [],
+        "popularMovies": [], # [{tmdbId, title, poster, type, year, status}]
+        "popularTV": [],
+        "updated_at": None,
+        "error": None,
+    },
 }
 DEBUG = {"last_realtime_raw": None, "last_slow_poll_error": None, "last_realtime_error": None,
-         "last_mc_error": None, "last_qbit_error": None}
+         "last_mc_error": None, "last_qbit_error": None, "last_seerr_error": None}
 
 
 def bytes_to_gb(n):
@@ -784,6 +811,193 @@ def qbit_torrent_action(torrent_hash, action):
         raise RuntimeError(f"qBittorrent returned HTTP {status}: {text[:200]!r}")
 
 
+# Small in-memory cache so repeated polls don't re-resolve the same title
+# from TMDB every cycle -- Seerr's /request and /media endpoints only return
+# tmdbId on the nested media object, not a title or poster.
+_SEERR_DETAILS_CACHE = {}
+
+TMDB_POSTER_BASE = "https://image.tmdb.org/t/p/w300"
+
+
+def seerr_request(path, params=None, method="GET", json_body=None, timeout=8):
+    """Minimal client for Seerr's REST API, X-Api-Key header auth. Mirrors
+    qbit_request()'s shape but Seerr needs no session/cookie handling."""
+    url = f"{SEERR_BASE_URL}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(json_body).encode() if json_body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("X-Api-Key", SEERR_API_KEY)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read().decode()
+
+
+def seerr_resolve_details(tmdb_id, media_type):
+    """Look up title + poster path for an item that only has a tmdbId
+    (the case for /request and /media results). Returns {"title", "poster"}."""
+    cache_key = (media_type, tmdb_id)
+    if cache_key in _SEERR_DETAILS_CACHE:
+        return _SEERR_DETAILS_CACHE[cache_key]
+    path = "movie" if media_type == "movie" else "tv"
+    try:
+        status, text = seerr_request(f"/api/v1/{path}/{tmdb_id}")
+        data = json.loads(text)
+        details = {
+            "title": data.get("title") or data.get("name") or f"tmdb:{tmdb_id}",
+            "poster": data.get("posterPath"),
+        }
+    except Exception:
+        details = {"title": f"tmdb:{tmdb_id}", "poster": None}
+    _SEERR_DETAILS_CACHE[cache_key] = details
+    return details
+
+
+def seerr_search(query):
+    """Live search proxy -- not cached in STATE, called on-demand from the
+    widget as the person types. TMDB multi-search results already carry
+    title/posterPath/mediaInfo directly, no follow-up lookup needed."""
+    status, text = seerr_request("/api/v1/search", {"query": query, "page": 1})
+    data = json.loads(text)
+    results = []
+    for r in data.get("results", []):
+        media_type = r.get("mediaType")
+        if media_type not in ("movie", "tv"):
+            continue  # skip "person" results
+        media_info = r.get("mediaInfo") or {}
+        date = r.get("releaseDate") or r.get("firstAirDate") or ""
+        results.append({
+            "tmdbId": r.get("id"),
+            "title": r.get("title") or r.get("name"),
+            "type": media_type,
+            "poster": r.get("posterPath"),
+            "year": date[:4],
+            # Seerr/Overseerr MediaStatus: None/1=not in library, 2=pending,
+            # 3=processing, 4=partially available, 5=available
+            "status": media_info.get("status"),
+        })
+        if len(results) >= 20:
+            break
+    return results
+
+
+def seerr_discover(media_type, take=15):
+    """Popular movies/TV -- Seerr's discover endpoints return TMDB-shaped
+    results (id, title/name, posterPath, releaseDate/firstAirDate,
+    mediaInfo), same shape as search, just no query."""
+    path = "/api/v1/discover/movies" if media_type == "movie" else "/api/v1/discover/tv"
+    status, text = seerr_request(path, {"page": 1})
+    data = json.loads(text)
+    results = []
+    for r in data.get("results", []):
+        media_info = r.get("mediaInfo") or {}
+        date = r.get("releaseDate") or r.get("firstAirDate") or ""
+        results.append({
+            "tmdbId": r.get("id"),
+            "title": r.get("title") or r.get("name"),
+            "type": media_type,
+            "poster": r.get("posterPath"),
+            "year": date[:4],
+            "status": media_info.get("status"),
+        })
+        if len(results) >= take:
+            break
+    return results
+
+
+def seerr_submit_request(tmdb_id, media_type):
+    """POST a new request to Seerr, which hands off to Radarr/Sonarr. Only
+    ever called from the relay's own /seerr-request route -- the API key
+    never reaches the widget's JS."""
+    status, text = seerr_request(
+        "/api/v1/request", method="POST",
+        json_body={"mediaType": media_type, "mediaId": tmdb_id},
+    )
+    return status in (200, 201), text
+
+
+def seerr_poll_once():
+    """One pass of the Seerr poll -- pulled out of the loop so a fresh
+    request submission can trigger an immediate refresh instead of waiting
+    up to SEERR_POLL_SECONDS for the next scheduled poll."""
+    try:
+        status, text = seerr_request("/api/v1/request", {"take": 15, "sort": "added"})
+        req_json = json.loads(text)
+
+        # Unlike the original version, this includes every recent request
+        # regardless of status -- not just ones awaiting admin approval --
+        # so the Requests tab can show Requested/Processing/Available states
+        # instead of only ever showing "pending".
+        requests_list = []
+        open_count = 0
+        for r in req_json.get("results", []):
+            media = r.get("media") or {}
+            tmdb_id = media.get("tmdbId")
+            media_type = r.get("type") or media.get("mediaType")
+            details = seerr_resolve_details(tmdb_id, media_type) if tmdb_id else {"title": f"Request #{r.get('id')}", "poster": None}
+            request_status = r.get("status")   # 1=pending approval, 2=approved, 3=declined
+            media_status = media.get("status")  # 1/None=unknown, 2=pending, 3=processing, 4=partial, 5=available
+            requests_list.append({
+                "id": r.get("id"),
+                "tmdbId": tmdb_id,
+                "title": details["title"],
+                "poster": details["poster"],
+                "type": media_type,
+                "requestedBy": (r.get("requestedBy") or {}).get("displayName", "Unknown"),
+                "status": media_status,
+                "requestStatus": request_status,
+            })
+            # "Open" = still awaiting approval or in progress, not yet
+            # available and not declined -- what the tab badge counts.
+            if request_status != 3 and media_status != 5:
+                open_count += 1
+
+        status2, text2 = seerr_request("/api/v1/media", {"filter": "available", "take": 30, "sort": "mediaAdded"})
+        recent_json = json.loads(text2)
+
+        recent_movies, recent_tv = [], []
+        for m in recent_json.get("results", []):
+            tmdb_id = m.get("tmdbId")
+            media_type = m.get("mediaType")
+            details = seerr_resolve_details(tmdb_id, media_type) if tmdb_id else {"title": f"Media #{m.get('id')}", "poster": None}
+            item = {"id": m.get("id"), "tmdbId": tmdb_id, "title": details["title"], "poster": details["poster"], "type": media_type, "status": 5}
+            (recent_movies if media_type == "movie" else recent_tv).append(item)
+
+        popular_movies = seerr_discover("movie")
+        popular_tv = seerr_discover("tv")
+
+        with STATE_LOCK:
+            s = STATE["seerr"]
+            s["online"] = True
+            s["openRequestsCount"] = open_count
+            s["requests"] = requests_list[:15]
+            s["recentMovies"] = recent_movies[:15]
+            s["recentTV"] = recent_tv[:15]
+            s["popularMovies"] = popular_movies
+            s["popularTV"] = popular_tv
+            s["updated_at"] = time.time()
+            s["error"] = None
+    except Exception as exc:
+        DEBUG["last_seerr_error"] = repr(exc)
+        with STATE_LOCK:
+            STATE["seerr"]["online"] = False
+            STATE["seerr"]["error"] = str(exc)
+            STATE["seerr"]["updated_at"] = time.time()
+
+
+def seerr_poll_thread_once():
+    """Fire-and-forget wrapper so a POST handler can kick off one extra
+    poll on its own thread without blocking the HTTP response."""
+    seerr_poll_once()
+
+
+def seerr_poll_thread():
+    while True:
+        seerr_poll_once()
+        time.sleep(SEERR_POLL_SECONDS)
+
+
 def mc_poll_thread(server_name, host, port):
     """Polls one Minecraft server directly (Java Server List Ping), not via
     Crafty. On success, refreshes every field for this server. On failure
@@ -1080,20 +1294,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/stats":
+        # Parse once so routes can read query params; existing exact-path
+        # routes below are unaffected since none of them ever carried a
+        # query string -- comparing parsed.path is equivalent for those.
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
+        qs = urllib.parse.parse_qs(parsed.query)
+
+        if path == "/stats":
             with STATE_LOCK:
                 payload = dict(STATE)
             with UPGRADE_LOCK:
                 payload["app_upgrading"] = list(UPGRADING)
                 payload["app_upgrade_results"] = dict(UPGRADE_RESULTS)
             self._send_json(payload)
-        elif self.path == "/mc-stats":
+        elif path == "/mc-stats":
             with STATE_LOCK:
                 self._send_json(STATE["minecraft_servers"])
-        elif self.path == "/qbit-stats":
+        elif path == "/qbit-stats":
             with STATE_LOCK:
                 self._send_json(STATE["qbittorrent"])
-        elif self.path == "/debug":
+        elif path == "/seerr-stats":
+            with STATE_LOCK:
+                self._send_json(STATE["seerr"])
+        elif path == "/seerr-search":
+            if not SEERR_ENABLED:
+                self.send_response(400)
+                self.end_headers()
+                return
+            query = (qs.get("q") or [""])[0].strip()
+            if not query:
+                self._send_json([])
+                return
+            try:
+                results = seerr_search(query)
+                self._send_json(results)
+            except Exception as exc:
+                DEBUG["last_seerr_error"] = repr(exc)
+                self._send_json({"error": str(exc)})
+        elif path == "/debug":
             self._send_json(DEBUG)
         else:
             self.send_response(404)
@@ -1179,6 +1418,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as exc:
                 DEBUG["last_qbit_error"] = repr(exc)
                 self._send_json({"started": False, "error": str(exc)})
+        elif self.path == "/seerr-request":
+            if not SEERR_ENABLED:
+                self.send_response(400)
+                self.end_headers()
+                return
+            tmdb_id = payload.get("tmdbId")
+            media_type = payload.get("mediaType")
+            if not tmdb_id or media_type not in ("movie", "tv"):
+                self.send_response(400)
+                self.end_headers()
+                return
+            try:
+                ok, text = seerr_submit_request(tmdb_id, media_type)
+                self._send_json({"success": ok, "response": text[:500]})
+                if ok:
+                    # Nudge the next poll to happen sooner so Recent
+                    # Requests reflects this immediately rather than
+                    # waiting up to SEERR_POLL_SECONDS.
+                    threading.Thread(target=seerr_poll_thread_once, daemon=True).start()
+            except Exception as exc:
+                DEBUG["last_seerr_error"] = repr(exc)
+                self._send_json({"success": False, "error": str(exc)})
         else:
             self.send_response(404)
             self.end_headers()
@@ -1199,6 +1460,8 @@ def main():
         threading.Thread(target=version_check_thread, daemon=True).start()
     if QBIT_ENABLED:
         threading.Thread(target=qbit_poll_thread, daemon=True).start()
+    if SEERR_ENABLED:
+        threading.Thread(target=seerr_poll_thread, daemon=True).start()
     with socketserver.ThreadingTCPServer(("127.0.0.1", PORT), Handler) as httpd:
         print(f"Serving TrueNAS stats on http://127.0.0.1:{PORT}/stats  (debug: /debug)")
         if MC_ENABLED:
@@ -1213,6 +1476,10 @@ def main():
                   "minecraft.crafty.api_token in config.json to enable start/stop")
         if QBIT_ENABLED:
             print(f"qBittorrent ({QBIT_BASE_URL}) polled every {QBIT_POLL_SECONDS}s -> /qbit-stats")
+        if SEERR_ENABLED:
+            print(f"Seerr ({SEERR_BASE_URL}) polled every {SEERR_POLL_SECONDS}s -> /seerr-stats")
+        else:
+            print("Seerr disabled -- set seerr.enabled=true and seerr.api_key in config.json to enable")
         httpd.serve_forever()
 
 
