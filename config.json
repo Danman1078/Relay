@@ -36,6 +36,12 @@
     "api_key": "",
     "poll_seconds": 30
   },
+  "plex": {
+    "enabled": true,
+    "base_url": "http://192.168.1.181:32400",
+    "token": "",
+    "poll_seconds": 5
+  },
   "qbittorrent": {
     "enabled": true,
     "base_url": "http://192.168.1.112:8080",
