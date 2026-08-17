@@ -1,9 +1,9 @@
-# TrueNAS + qBittorrent + Minecraft + Seerr iCUE Widget Relay
+# TrueNAS + qBittorrent + Minecraft + Seerr + Plex iCUE Widget Relay
 
 A local relay that polls a TrueNAS SCALE server, one or more Crafty-managed
-Minecraft servers, qBittorrent, and Seerr, then serves the combined state as
-JSON over localhost for Corsair iCUE XENEON Edge widgets to display and
-control.
+Minecraft servers, qBittorrent, Seerr, and Plex, then serves the combined
+state as JSON over localhost for Corsair iCUE XENEON Edge widgets to
+display and control.
 
 ## Why a relay exists at all
 
@@ -11,11 +11,12 @@ iCUE widgets run in a sandboxed webview: they can't hold API keys securely,
 can't speak TrueNAS's WebSocket/JSON-RPC API, can't do raw TCP (which is
 what pinging a Minecraft server actually requires), and can't survive
 qBittorrent's cookie-session auth or SameSite restrictions across origins.
-Seerr's REST API is friendlier (a simple `X-Api-Key` header), but the key
-still shouldn't sit in a webview's JS where it's visible to anyone who
-opens devtools on the widget. The relay is a small always-on Python
-process on the same Windows PC as iCUE that does all of this server-side,
-and exposes the result as plain JSON the widget can `fetch()`.
+Seerr and Plex's REST APIs are friendlier (a simple header carries the
+credential), but that credential still shouldn't sit in a webview's JS
+where it's visible to anyone who opens devtools on the widget. The relay
+is a small always-on Python process on the same Windows PC as iCUE that
+does all of this server-side, and exposes the result as plain JSON the
+widget can `fetch()`.
 
 ```
 ┌─────────────┐        ┌───────────────┐        ┌────────────────────┐
@@ -27,12 +28,15 @@ and exposes the result as plain JSON the widget can `fetch()`.
 ├─────────────┤        │    8787)      │        │  /mc-stats,        │
 │ Crafty      │  REST  │               │        │  /qbit-stats,      │
 │ Controller  │◄──────►│               │        │  /seerr-stats,     │
-├─────────────┤        │               │        │  /seerr-search)    │
-│ qBittorrent │  REST  │               │        │                    │
+├─────────────┤        │               │        │  /seerr-search,    │
+│ qBittorrent │  REST  │               │        │  /plex-stats)      │
 │ (session)   │◄──────►│               │        │                    │
 ├─────────────┤        │               │        │                    │
 │ Seerr       │  REST  │               │        │                    │
 │ (API key)   │◄──────►│               │        │                    │
+├─────────────┤        │               │        │                    │
+│ Plex        │  REST  │               │        │                    │
+│ (token)     │◄──────►│               │        │                    │
 └─────────────┘        └───────────────┘        └────────────────────┘
 ```
 
@@ -81,6 +85,17 @@ key attached, so the key never reaches the widget's JS. Request/media
 titles and posters are resolved via a follow-up TMDB lookup and cached in
 memory, since Seerr's request/media list endpoints only return IDs, not
 titles.
+
+**Plex** — polled via `X-Plex-Token` header auth against the Plex Media
+Server's own REST API (no separate API-key system — the token is the same
+one Plex's own apps use, generated once via a Plex sign-in). Reports live
+playback sessions — poster, user, device, playback state, progress,
+direct play vs. direct stream vs. transcode (and whether a transcode is
+using hardware acceleration), per-session bandwidth, and LAN vs. WAN — plus
+recently added movies/TV/seasons/episodes. Also supports stopping
+("kicking") a session: the widget calls the relay, the relay forwards to
+Plex's terminate endpoint with the token attached, same pattern as Seerr's
+request submission.
 
 ## Setup
 
@@ -163,6 +178,27 @@ or subnet-whitelist auth instead of a login form.
   refreshed in the background. Search is live, not on this schedule — it
   only runs when someone's actually typing in the widget.
 
+`plex` (optional):
+
+```json
+"plex": {
+  "enabled": true,
+  "base_url": "http://192.168.1.181:32400",
+  "token": "...",
+  "poll_seconds": 5
+}
+```
+
+- `base_url` — the Plex Media Server's own address (not a separate
+  service — same host:port your Plex apps already connect to).
+- `token` — sign in to Plex's web app, open any item's **Get Info → View
+  XML** link, and copy the `X-Plex-Token` value from the resulting URL.
+  Plex has no separate API-key system; this is the same token the web app
+  itself uses.
+- `poll_seconds` — kept short (5s default) relative to the other
+  integrations since Now Playing is meant to feel live, not like a
+  periodic status check.
+
 Run it:
 
 ```
@@ -180,13 +216,14 @@ curl http://127.0.0.1:8787/stats
 curl http://127.0.0.1:8787/mc-stats
 curl http://127.0.0.1:8787/qbit-stats
 curl http://127.0.0.1:8787/seerr-stats
+curl http://127.0.0.1:8787/plex-stats
 ```
 
 ## Endpoints
 
 | Endpoint          | Method | Purpose |
 |-------------------|--------|---------|
-| `/stats`          | GET    | Full combined payload — TrueNAS, Minecraft, qBittorrent, and Seerr all in one response |
+| `/stats`          | GET    | Full combined payload — TrueNAS, Minecraft, qBittorrent, Seerr, and Plex all in one response |
 | `/mc-stats`       | GET    | Minecraft + Crafty payload for every configured server |
 | `/mc-action`      | POST   | `{"action": "start"\|"stop"\|"restart"\|"backup", "server": "<name>"}` |
 | `/qbit-stats`     | GET    | qBittorrent payload (torrents + transfer totals) |
@@ -194,6 +231,8 @@ curl http://127.0.0.1:8787/seerr-stats
 | `/seerr-stats`    | GET    | Seerr payload — recently added (movies/TV), popular (movies/TV), and recent requests with status |
 | `/seerr-search`   | GET    | `?q=<query>` — live search proxy, not cached; hits Seerr on every call |
 | `/seerr-request`  | POST   | `{"tmdbId": <id>, "mediaType": "movie"\|"tv"}` — submits a new request to Seerr |
+| `/plex-stats`     | GET    | Plex payload — active sessions (with playback/transcode/bandwidth detail) and recently added |
+| `/plex-stop`      | POST   | `{"sessionId": "<id>"}` — terminates ("kicks") an active playback session |
 | `/update-app`, `/update-all` | POST | Trigger TrueNAS app upgrades |
 | `/debug`          | GET    | Last raw payloads and last errors — check this first when a field is missing or wrong |
 
@@ -249,6 +288,39 @@ Seerr quirks:
   The widget's status pills are driven by both — a declined request shows
   as declined regardless of what the (now irrelevant) media status says.
 
+Plex quirks:
+
+- Pagination (`X-Plex-Container-Size`/`-Start`) must be sent as HTTP
+  **headers**, not query params — confirmed against a live instance where
+  passing the size as a query param was silently ignored and Plex's
+  default page size (50) came back instead of the requested limit.
+- Whether a session is transcoding is more reliably read from
+  `Media.Part.decision` (`"directplay"` / `"copy"` / `"transcode"`) than
+  from checking whether a `TranscodeSession` element is present at all —
+  confirmed a real direct-play session that had no `TranscodeSession`
+  element, which is the expected/documented behavior, but relying on
+  element presence alone as the *only* transcoding signal would miss
+  edge cases `decision` catches directly.
+- `Player.title` (the friendly device name, e.g. "Daniel's S25") is a far
+  more useful "device" label than `Player.device` (a raw model string,
+  e.g. "SM-S931B") — both exist on every session, the relay prefers the
+  former.
+- `/library/recentlyAdded` mixes top-level types: movies come back as
+  flat `Video`/`movie` entries, but TV is reported at the **season**
+  level as `Directory`/`season` entries (the whole season was added, not
+  individual episodes) — these need `parentTitle`/`parentThumb` (the
+  show) rather than their own bare "Season 1" title/thumb to be useful at
+  a glance. Episode-level entries (seen in `/status/sessions`, for Now
+  Playing) use `grandparentTitle`/`-Thumb` the same way, one level
+  further up.
+- `Session.location` (`"lan"` / `"wan"`) is the local-vs-remote signal,
+  separate from `Session.bandwidth` (kbps) — both live on the same
+  `Session` element, distinct from `Player` and `TranscodeSession`.
+- `Session.id` — not `Player.machineIdentifier` — is the value
+  `/status/sessions/terminate` expects as its `sessionId` param for
+  stopping a stream. They happened to match in testing, but `Session.id`
+  is the field the terminate endpoint actually documents.
+
 ## Widgets
 
 ### `mc-widget/`
@@ -289,10 +361,36 @@ and tap to request, all from the touchscreen.
 - Tapping the **+** on any poster (search results or Popular rows) submits
   a request through the relay — the widget never holds the Seerr API key.
 
-Poll interval and the relay's port are both configurable from iCUE's
-Personalization panel (Connection group) without editing the widget files.
+### `plex-widget/`
 
-Package either widget with:
+A live Now Playing dashboard, not a request browser like `seerr-widget/`
+— built for glancing at what's streaming right now and whether it's
+straining the server.
+
+- **Now Playing** — one card per active session: poster, title, "user ·
+  device", a colored state dot (playing/paused/buffering), a LAN/WAN
+  pill, a progress bar along the poster's bottom edge, and a mode pill
+  underneath (Direct Play / Direct Stream / Transcoding — with a ⚡ when a
+  transcode is using hardware acceleration) plus per-session bandwidth.
+  A single active session gets a wider card centered in the row instead
+  of a small card in an otherwise empty space; idle (no sessions) shows a
+  compact centered "Nothing playing" state instead of a large blank area,
+  and Recently Added takes the freed vertical space.
+- A stop (⏻) button per session requires a second confirming tap before
+  it actually terminates that playback session — same pattern as the
+  Minecraft widget's Stop/Restart confirmation.
+- **Recently Added** — same compact poster style as the Seerr widget,
+  with a small badge per poster (`MOVIE`, `SHOW`, `SEASON n`, or
+  `Sn · En` for episodes) so a TV-heavy library doesn't read as an
+  undifferentiated poster wall.
+- The top bar's subtext line doubles as an at-a-glance summary — `0
+  streams` when idle, or `2 streams · 1 transcoding` when active.
+
+Poll interval and the relay's port are both configurable from iCUE's
+Personalization panel (Connection group) on every widget, without editing
+the widget files.
+
+Package any widget with:
 
 ```
 icuewidget validate
