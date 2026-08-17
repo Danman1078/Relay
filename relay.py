@@ -129,6 +129,24 @@ SEERR_API_KEY = SEERR_CFG.get("api_key", "")
 SEERR_POLL_SECONDS = SEERR_CFG.get("poll_seconds", 30)
 SEERR_REQUEST_STATUS_PENDING = 1
 
+# Plex Media Server -- polled via X-Plex-Token header auth (Plex has no
+# separate API-key system; the token is generated once via a Plex sign-in
+# and used directly). Reports live playback sessions (with transcode
+# status/hardware acceleration) and recently added media. Field names below
+# are based on Plex's documented XML/JSON API shape -- not yet confirmed
+# against a real response from this instance, so treat this as a first
+# pass to test and adjust, same as the early Seerr integration was.
+# config.json shape:
+#   "plex": {
+#     "enabled": true, "base_url": "http://192.168.1.181:32400",
+#     "token": "...", "poll_seconds": 5
+#   }
+PLEX_CFG = CONFIG.get("plex") or {}
+PLEX_ENABLED = PLEX_CFG.get("enabled", False)
+PLEX_BASE_URL = PLEX_CFG.get("base_url", "http://192.168.1.181:32400").rstrip("/")
+PLEX_TOKEN = PLEX_CFG.get("token", "")
+PLEX_POLL_SECONDS = PLEX_CFG.get("poll_seconds", 5)
+
 
 def qbit_classify(state):
     """Returns "dl" | "up" | "paused" | "stopped". Deliberately a catch-all
@@ -295,9 +313,19 @@ STATE = {
         "updated_at": None,
         "error": None,
     },
+    "plex": {
+        "enabled": PLEX_ENABLED,
+        "online": False,
+        "sessionCount": None,
+        "transcodingCount": None,
+        "sessions": [],       # [{title, type, thumb, user, state, progress, transcoding, hwTranscode, quality, bandwidthKbps, location, device, sessionId}]
+        "recentlyAdded": [],  # [{title, type, thumb, addedAt}]
+        "updated_at": None,
+        "error": None,
+    },
 }
 DEBUG = {"last_realtime_raw": None, "last_slow_poll_error": None, "last_realtime_error": None,
-         "last_mc_error": None, "last_qbit_error": None, "last_seerr_error": None}
+         "last_mc_error": None, "last_qbit_error": None, "last_seerr_error": None, "last_plex_error": None}
 
 
 def bytes_to_gb(n):
@@ -998,6 +1026,212 @@ def seerr_poll_thread():
         time.sleep(SEERR_POLL_SECONDS)
 
 
+def plex_request(path, params=None, headers=None, timeout=8):
+    """Minimal client for Plex's API. Auth is via X-Plex-Token header (Plex
+    has no separate API-key concept -- this token comes from a one-time
+    Plex sign-in). Accept: application/json gets JSON back instead of
+    Plex's default XML. Pagination (X-Plex-Container-Size/-Start) must be
+    sent as headers, not query params -- confirmed against a live instance
+    where passing it as a query param was silently ignored and the default
+    page size (50) came back instead."""
+    url = f"{PLEX_BASE_URL}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url)
+    req.add_header("X-Plex-Token", PLEX_TOKEN)
+    req.add_header("Accept", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, str(v))
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read().decode()
+
+
+def plex_thumb_url(thumb_path):
+    """Plex thumb/art paths are relative and themselves need the token to
+    load -- build a full URL the widget's <img> can use directly."""
+    if not thumb_path:
+        return None
+    sep = "&" if "?" in thumb_path else "?"
+    return f"{PLEX_BASE_URL}{thumb_path}{sep}X-Plex-Token={PLEX_TOKEN}"
+
+
+def plex_display_item(m):
+    """Normalizes a /library/recentlyAdded entry into {title, type, thumb,
+    addedAt, badge}. Confirmed against a real response that recentlyAdded
+    mixes top-level types -- movies come back as flat Video/movie entries,
+    but TV is reported at the season level as Directory/season entries (the
+    whole season was added, not individual episodes), each needing its
+    parentTitle/parentThumb (the show) rather than its own bare "Season 1"
+    title/thumb to be useful at a glance. Episode-level entries (seen in
+    /status/sessions, not confirmed here for recentlyAdded) use
+    grandparentTitle/-Thumb the same way, one level further up -- handled
+    the same for consistency. "badge" is a short display label
+    distinguishing movie/season/episode -- season's own "index" attribute
+    is the season number; an episode's "parentIndex"/"index" are the
+    season/episode numbers respectively (standard Plex convention)."""
+    t = m.get("type")
+    if t == "episode":
+        show = m.get("grandparentTitle")
+        title = f"{show} \u2013 {m.get('title')}" if show else m.get("title")
+        thumb = m.get("thumb") or m.get("grandparentThumb")
+        season_num = m.get("parentIndex")
+        ep_num = m.get("index")
+        badge = f"S{season_num} \u00b7 E{ep_num}" if season_num is not None and ep_num is not None else "EPISODE"
+    elif t == "season":
+        show = m.get("parentTitle")
+        title = f"{show} \u2013 {m.get('title')}" if show else m.get("title")
+        thumb = m.get("thumb") or m.get("parentThumb")
+        season_num = m.get("index")
+        badge = f"SEASON {season_num}" if season_num is not None else "SEASON"
+    elif t == "show":
+        title = m.get("title")
+        thumb = m.get("thumb")
+        badge = "SHOW"
+    else:  # movie
+        title = m.get("title")
+        thumb = m.get("thumb")
+        badge = "MOVIE"
+    return {
+        "title": title,
+        "type": t,
+        "badge": badge,
+        "thumb": plex_thumb_url(thumb),
+        "addedAt": m.get("addedAt"),
+    }
+
+def plex_poll_once():
+    """One pass of the Plex poll: active sessions (with transcode/hardware
+    status) and recently added media. NOTE: field names/paths below follow
+    Plex's documented API shape but haven't been confirmed against a real
+    response from this instance yet -- if sessions or recently-added come
+    back empty or wrong, check /debug's last_plex_error and paste a raw
+    /status/sessions response so the field mapping can be corrected, same
+    process used to nail down Seerr's actual shape earlier."""
+    try:
+        status, text = plex_request("/status/sessions")
+        data = json.loads(text)
+        raw_sessions = (data.get("MediaContainer") or {}).get("Metadata") or []
+
+        sessions = []
+        transcoding_count = 0
+        for m in raw_sessions:
+            media0 = (m.get("Media") or [{}])[0]
+            part0 = (media0.get("Part") or [{}])[0]
+            # decision is the authoritative play-mode signal, always present
+            # regardless of whether a TranscodeSession element also is --
+            # confirmed against a real direct-play session that had no
+            # TranscodeSession element at all.
+            decision = part0.get("decision")  # "directplay" | "copy" | "transcode"
+            video_res = media0.get("videoResolution")  # e.g. "1080", "4k"
+            transcode = m.get("TranscodeSession")
+            is_transcoding = decision == "transcode" or transcode is not None
+            if is_transcoding:
+                transcoding_count += 1
+
+            if decision == "transcode":
+                mode_label = "Transcoding"
+            elif decision == "copy":
+                mode_label = "Direct Stream"
+            else:
+                mode_label = "Direct Play"
+            quality = f"{video_res} \u00b7 {mode_label}" if video_res else mode_label
+
+            player = m.get("Player") or {}
+            user = m.get("User") or {}
+            session_info = m.get("Session") or {}
+
+            duration = m.get("duration") or 0
+            offset = m.get("viewOffset") or 0
+            progress = (offset / duration) if duration else 0
+
+            title = m.get("title")
+            if m.get("type") == "episode":
+                show = m.get("grandparentTitle")
+                if show:
+                    title = f"{show} \u2013 {title}"
+
+            sessions.append({
+                "title": title,
+                "type": m.get("type"),
+                "thumb": plex_thumb_url(m.get("thumb") or m.get("grandparentThumb")),
+                "user": user.get("title", "Unknown"),
+                "state": player.get("state"),  # playing | paused | buffering
+                "progress": round(progress, 3),
+                "transcoding": is_transcoding,
+                "hwTranscode": bool(transcode.get("transcodeHwRequested")) if transcode else False,
+                "quality": quality,
+                "bandwidthKbps": session_info.get("bandwidth"),
+                "location": session_info.get("location"),  # "lan" | "wan"
+                # Player.title is the friendly device name (e.g. "Daniel's
+                # S25"); Player.device is a raw model string (e.g.
+                # "SM-S931B") -- confirmed the former is far more useful.
+                "device": player.get("title") or player.get("product") or player.get("device"),
+                # Session.id is what /status/sessions/terminate expects as
+                # its sessionId param -- confirmed it's a distinct value
+                # from ratingKey/Player.machineIdentifier in a real
+                # response (they happened to match in the sample seen, but
+                # Session.id is the field the terminate endpoint documents).
+                "sessionId": session_info.get("id"),
+            })
+
+        recently_added = []
+        try:
+            status2, text2 = plex_request(
+                "/library/recentlyAdded",
+                headers={"X-Plex-Container-Size": 15, "X-Plex-Container-Start": 0},
+            )
+            data2 = json.loads(text2)
+            for m in (data2.get("MediaContainer") or {}).get("Metadata") or []:
+                recently_added.append(plex_display_item(m))
+        except Exception as exc2:
+            # Recently-added is a nice-to-have -- don't let it take down
+            # session reporting if this specific endpoint isn't right for
+            # this Plex version.
+            DEBUG["last_plex_error"] = f"recentlyAdded: {exc2!r}"
+
+        with STATE_LOCK:
+            s = STATE["plex"]
+            s["online"] = True
+            s["sessionCount"] = len(sessions)
+            s["transcodingCount"] = transcoding_count
+            s["sessions"] = sessions
+            s["recentlyAdded"] = recently_added
+            s["updated_at"] = time.time()
+            s["error"] = None
+    except Exception as exc:
+        DEBUG["last_plex_error"] = repr(exc)
+        with STATE_LOCK:
+            STATE["plex"]["online"] = False
+            STATE["plex"]["error"] = str(exc)
+            STATE["plex"]["updated_at"] = time.time()
+
+
+def plex_stop_session(session_id, reason="Stopped from iCUE widget"):
+    """Terminates a playback session -- kicks the stream. Uses Plex's
+    documented /status/sessions/terminate endpoint. Destructive, so the
+    widget requires a second confirming tap before this is ever called,
+    same pattern as the Minecraft widget's Stop/Restart confirmation."""
+    status, text = plex_request(
+        "/status/sessions/terminate",
+        {"sessionId": session_id, "reason": reason},
+    )
+    return status == 200, text
+
+
+def plex_poll_thread_once():
+    """Fire-and-forget wrapper so a POST handler can kick off one extra
+    poll on its own thread without blocking the HTTP response -- mirrors
+    seerr_poll_thread_once so a stopped session disappears from Now
+    Playing immediately instead of waiting up to PLEX_POLL_SECONDS."""
+    plex_poll_once()
+
+
+def plex_poll_thread():
+    while True:
+        plex_poll_once()
+        time.sleep(PLEX_POLL_SECONDS)
+
+
 def mc_poll_thread(server_name, host, port):
     """Polls one Minecraft server directly (Java Server List Ping), not via
     Crafty. On success, refreshes every field for this server. On failure
@@ -1317,6 +1551,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/seerr-stats":
             with STATE_LOCK:
                 self._send_json(STATE["seerr"])
+        elif path == "/plex-stats":
+            with STATE_LOCK:
+                self._send_json(STATE["plex"])
         elif path == "/seerr-search":
             if not SEERR_ENABLED:
                 self.send_response(400)
@@ -1440,6 +1677,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as exc:
                 DEBUG["last_seerr_error"] = repr(exc)
                 self._send_json({"success": False, "error": str(exc)})
+        elif self.path == "/plex-stop":
+            if not PLEX_ENABLED:
+                self.send_response(400)
+                self.end_headers()
+                return
+            session_id = payload.get("sessionId")
+            if not session_id:
+                self.send_response(400)
+                self.end_headers()
+                return
+            try:
+                ok, text = plex_stop_session(session_id)
+                self._send_json({"success": ok, "response": text[:500]})
+                if ok:
+                    threading.Thread(target=plex_poll_thread_once, daemon=True).start()
+            except Exception as exc:
+                DEBUG["last_plex_error"] = repr(exc)
+                self._send_json({"success": False, "error": str(exc)})
         else:
             self.send_response(404)
             self.end_headers()
@@ -1462,6 +1717,8 @@ def main():
         threading.Thread(target=qbit_poll_thread, daemon=True).start()
     if SEERR_ENABLED:
         threading.Thread(target=seerr_poll_thread, daemon=True).start()
+    if PLEX_ENABLED:
+        threading.Thread(target=plex_poll_thread, daemon=True).start()
     with socketserver.ThreadingTCPServer(("127.0.0.1", PORT), Handler) as httpd:
         print(f"Serving TrueNAS stats on http://127.0.0.1:{PORT}/stats  (debug: /debug)")
         if MC_ENABLED:
@@ -1480,6 +1737,10 @@ def main():
             print(f"Seerr ({SEERR_BASE_URL}) polled every {SEERR_POLL_SECONDS}s -> /seerr-stats")
         else:
             print("Seerr disabled -- set seerr.enabled=true and seerr.api_key in config.json to enable")
+        if PLEX_ENABLED:
+            print(f"Plex ({PLEX_BASE_URL}) polled every {PLEX_POLL_SECONDS}s -> /plex-stats")
+        else:
+            print("Plex disabled -- set plex.enabled=true and plex.token in config.json to enable")
         httpd.serve_forever()
 
 
